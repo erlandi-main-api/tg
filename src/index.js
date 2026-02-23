@@ -1,13 +1,28 @@
+const DEFAULT_LANG = "id"; // default target language
+const LANGS = [
+  ["🇮🇩 ID", "id"],
+  ["🇬🇧 EN", "en"],
+  ["🇯🇵 JA", "ja"],
+  ["🇰🇷 KO", "ko"],
+  ["🇨🇳 ZH", "zh-CN"],
+  ["🇷🇺 RU", "ru"],
+  ["🇹🇭 TH", "th"],
+  ["🇻🇳 VI", "vi"],
+  ["🇸🇦 AR", "ar"],
+  ["🇫🇷 FR", "fr"],
+  ["🇩🇪 DE", "de"],
+  ["🇪🇸 ES", "es"],
+];
+
 export default {
   async fetch(request, env) {
-    if (request.method !== "POST") return new Response("OK");
+    if (request.method !== "POST") return new Response("Translate Bot OK");
 
     const update = await request.json();
 
-    // Optional: if you later add inline buttons, Telegram sends callback_query.
+    // ===== handle buttons =====
     if (update.callback_query) {
-      try { await answerCallbackQuery(env, update.callback_query.id); } catch {}
-      try { await sendHelp(env, update.callback_query.message.chat.id); } catch {}
+      await handleCallback(env, update.callback_query);
       return new Response("ok");
     }
 
@@ -15,301 +30,258 @@ export default {
 
     const msg = update.message;
     const chatId = msg.chat.id;
-    const userId = msg.from.id;
     const text = msg.text || "";
 
-    // ========= /ping =========
-    if (text === "/ping") {
-      await sendMessage(env, chatId, "🏓 Pong! 1 ms");
+    // ===== commands (only /start & /help) =====
+    if (text.startsWith("/start")) {
+      await sendStart(env, chatId);
       return new Response("ok");
     }
 
-    // ========= /help & /start =========
-    if (text === "/help" || text.startsWith("/start")) {
-      await sendHelp(env, chatId);
+    if (text.startsWith("/help")) {
+      await sendMenu(env, chatId);
       return new Response("ok");
     }
 
-    // ========= /stats =========
-    if (text === "/stats") {
-      const tg = await env.FILES.get("stats:tg") || "0";
-      const tr = await env.FILES.get("stats:tr") || "0";
-      const auto = await env.FILES.get("stats:auto") || "0";
+    // ignore ALL other commands to keep it clean/professional
+    if (text.startsWith("/")) return new Response("ok");
 
-      await sendMessage(
-        env,
-        chatId,
-        `📊 Bot Statistics\n\n📝 Telegraph dibuat: ${tg}\n🌍 Translate manual: ${tr}\n⚡ Auto translate: ${auto}`
-      );
-      return new Response("ok");
-    }
+    // ===== auto translate normal text =====
+    // Load per-chat config
+    const cfg = await getChatConfig(env, chatId);
 
-    // ========= /settr =========
-    // 1) /settr id            -> set default translate user
-    // 2) /settr auto id on    -> enable auto translate for this chat
-    // 3) /settr auto off      -> disable auto translate for this chat
-    if (text.startsWith("/settr")) {
-      const args = text.replace("/settr", "").trim();
-      if (!args) {
-        await sendMessage(
-          env,
-          chatId,
-          "Format:\n/settr id\n/settr auto id on\n/settr auto off"
-        );
-        return new Response("ok");
-      }
+    // If auto OFF, do nothing
+    if (!cfg.on) return new Response("ok");
 
-      const parts = args.split(/\s+/);
+    // Prevent loops: don't translate messages that look like our output
+    if (text.startsWith("🌍 ")) return new Response("ok");
 
-      if (parts[0] === "auto") {
-        if (parts[1] === "off") {
-          await env.FILES.delete(`autotr:${chatId}`);
-          await sendMessage(env, chatId, "✅ Auto translate: OFF (chat ini)");
-          return new Response("ok");
-        }
+    // Translate
+    const result = await gTranslate(text, cfg.lang);
 
-        const lang = (parts[1] || "").toLowerCase();
-        const onoff = (parts[2] || "").toLowerCase();
+    const from = (result.detectedLang || "??").toUpperCase();
+    const to = (cfg.lang || "??").toUpperCase();
 
-        if (!lang || !onoff) {
-          await sendMessage(env, chatId, "Format: /settr auto id on  atau  /settr auto off");
-          return new Response("ok");
-        }
+    const fromFlag = getFlag(result.detectedLang);
+    const toFlag = getFlag(cfg.lang);
 
-        if (onoff !== "on" && onoff !== "off") {
-          await sendMessage(env, chatId, "Pakai: on atau off\nContoh: /settr auto id on");
-          return new Response("ok");
-        }
-
-        if (onoff === "off") {
-          await env.FILES.delete(`autotr:${chatId}`);
-          await sendMessage(env, chatId, "✅ Auto translate: OFF (chat ini)");
-          return new Response("ok");
-        }
-
-        await env.FILES.put(`autotr:${chatId}`, JSON.stringify({ on: true, lang }));
-        await sendMessage(env, chatId, `✅ Auto translate: ON (chat ini) → ${lang}\n\nSekarang semua pesan teks akan otomatis diterjemahkan.`);
-        return new Response("ok");
-      }
-
-      // normal set default user language
-      const lang = parts[0].toLowerCase();
-      await env.FILES.put(`trlang:${userId}`, lang);
-      await sendMessage(env, chatId, `✅ Default translate kamu: ${lang}`);
-      return new Response("ok");
-    }
-
-    // ========= /tr (manual translate) =========
-    // 1) Reply pesan + "/tr" -> pakai default (atau id)
-    // 2) "/tr teks..."       -> pakai default (atau id)
-    // 3) "/tr en teks..."    -> override lang
-    if (text.startsWith("/tr")) {
-      let targetLang = (await env.FILES.get(`trlang:${userId}`)) || "id";
-      const raw = text.replace("/tr", "").trim();
-
-      let textToTranslate = "";
-
-      if (msg.reply_to_message?.text && !raw) {
-        textToTranslate = msg.reply_to_message.text;
-      } else if (raw) {
-        const parts = raw.split(/\s+/);
-        if (/^[a-z]{2,5}$/.test(parts[0]) && parts.length >= 2) {
-          targetLang = parts[0].toLowerCase();
-          textToTranslate = parts.slice(1).join(" ");
-        } else {
-          textToTranslate = raw;
-        }
-      } else {
-        await sendMessage(env, chatId, "Reply pesan lalu ketik /tr\natau\n/tr id Hello world\natau\n/tr en Hello");
-        return new Response("ok");
-      }
-
-      const translated = await translate(textToTranslate, targetLang);
-      await increaseStat(env, "stats:tr");
-      await sendMessage(env, chatId, `🌍 (${targetLang})\n\n${translated}`);
-      return new Response("ok");
-    }
-
-    // ========= /tg (Telegraph) =========
-    // - Reply text/caption/photo then /tg or /tg Judul
-    // - Output only link (hemat)
-    if (text.startsWith("/tg")) {
-      const raw = text.replace("/tg", "").trim();
-      const title = raw ? raw.split("\n")[0].trim() : "Telegraph Post";
-
-      const r = msg.reply_to_message;
-
-      let bodyText = "";
-      let imagePath = "";
-
-      if (r) {
-        bodyText = (r.text || r.caption || "").trim();
-
-        const photo = r.photo?.[r.photo.length - 1];
-        if (photo) {
-          try {
-            imagePath = await uploadTelegramPhotoToTelegraph(env, photo.file_id);
-          } catch {
-            imagePath = "";
-          }
-        }
-        // Videos are not supported by Telegraph; we only use caption/text if any.
-      } else {
-        // legacy mode: /tg Judul\n\nIsi...
-        const lines = raw.split("\n");
-        bodyText = lines.slice(1).join("\n").trim();
-      }
-
-      if (!bodyText && !imagePath) {
-        await sendMessage(env, chatId, "Reply text/foto lalu /tg (atau /tg Judul).");
-        return new Response("ok");
-      }
-
-      let token = await env.FILES.get("telegraph_token");
-      if (!token) {
-        const acc = await fetch("https://api.telegra.ph/createAccount", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ short_name: "telebot", author_name: "Tele Bot" })
-        });
-        const data = await acc.json();
-        token = data?.result?.access_token;
-        if (!token) {
-          await sendMessage(env, chatId, "Gagal membuat akun Telegraph.");
-          return new Response("ok");
-        }
-        await env.FILES.put("telegraph_token", token);
-      }
-
-      const content = [];
-
-      if (imagePath) {
-        content.push({ tag: "img", attrs: { src: `https://telegra.ph${imagePath}` } });
-      }
-
-      if (bodyText) {
-        const paragraphs = bodyText
-          .split("\n\n")
-          .map((p) => p.trim())
-          .filter(Boolean)
-          .map((p) => ({ tag: "p", children: [p] }));
-        content.push(...paragraphs);
-      }
-
-      const page = await fetch("https://api.telegra.ph/createPage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          access_token: token,
-          title,
-          content,
-          return_content: false
-        })
-      });
-
-      const result = await page.json();
-      if (!result.ok) {
-        await sendMessage(env, chatId, "Gagal membuat Telegraph page.");
-        return new Response("ok");
-      }
-
-      await increaseStat(env, "stats:tg");
-      await sendMessage(env, chatId, result.result.url); // link only
-      return new Response("ok");
-    }
-
-    // ========= AUTO TRANSLATE (all text messages in chat) =========
-    // Only if enabled for this chat:
-    // /settr auto id on
-    // /settr auto off
-    if (msg.text) {
-      if (msg.from?.is_bot) return new Response("ok");
-      if (msg.text.startsWith("/")) return new Response("ok");
-      if (msg.text.startsWith("🌍 (")) return new Response("ok"); // prevent loops
-
-      const autoCfgStr = await env.FILES.get(`autotr:${chatId}`);
-      if (autoCfgStr) {
-        let cfg = null;
-        try { cfg = JSON.parse(autoCfgStr); } catch {}
-        if (cfg?.on && cfg?.lang) {
-          const translated = await translate(msg.text, cfg.lang);
-          await increaseStat(env, "stats:auto");
-          await sendMessage(env, chatId, `🌍 (${cfg.lang})\n\n${translated}`);
-        }
-      }
-    }
+    // Professional output (short & clear)
+    await sendMessage(
+      env,
+      chatId,
+      `🌍 ${fromFlag} ${from} ➜ ${toFlag} ${to}\n\n${result.translated}`
+    );
 
     return new Response("ok");
-  }
+  },
 };
 
-// ===== Helpers =====
+// ================== CALLBACKS / BUTTON MENU ==================
 
-async function translate(text, lang) {
-  const res = await fetch(
-    `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=auto|${encodeURIComponent(lang)}`
-  );
-  const data = await res.json();
-  return data?.responseData?.translatedText || "Gagal translate.";
+async function handleCallback(env, cq) {
+  const chatId = cq.message?.chat?.id;
+  const data = cq.data || "";
+  if (!chatId) return;
+
+  // stop loading spinner on button
+  await answerCallbackQuery(env, cq.id);
+
+  // Get config
+  let cfg = await getChatConfig(env, chatId);
+
+  if (data === "TOGGLE_ON") {
+    cfg.on = true;
+    await setChatConfig(env, chatId, cfg);
+    await editMenu(env, chatId, cq.message.message_id, cfg);
+    return;
+  }
+
+  if (data === "TOGGLE_OFF") {
+    cfg.on = false;
+    await setChatConfig(env, chatId, cfg);
+    await editMenu(env, chatId, cq.message.message_id, cfg);
+    return;
+  }
+
+  if (data === "SHOW_MENU") {
+    await editMenu(env, chatId, cq.message.message_id, cfg);
+    return;
+  }
+
+  if (data.startsWith("SET_LANG:")) {
+    const lang = data.split(":")[1] || DEFAULT_LANG;
+    cfg.lang = lang;
+    await setChatConfig(env, chatId, cfg);
+    await editMenu(env, chatId, cq.message.message_id, cfg);
+    return;
+  }
+
+  if (data === "HOW_GROUP") {
+    await sendMessage(
+      env,
+      chatId,
+      `📌 Info Group\n\n` +
+        `Agar bot bisa membaca semua pesan di group (bukan hanya command), matikan privacy mode:\n` +
+        `BotFather → /mybots → pilih bot → Bot Settings → Group Privacy → Turn off`
+    );
+    return;
+  }
 }
 
-async function increaseStat(env, key) {
-  const cur = parseInt((await env.FILES.get(key)) || "0", 10);
-  await env.FILES.put(key, String(cur + 1));
-}
+// ================== MENU UI ==================
 
-async function sendHelp(env, chatId) {
+async function sendStart(env, chatId) {
+  const cfg = await getChatConfig(env, chatId);
+
   await sendMessage(
     env,
     chatId,
-`🤖 BOT HELP & TUTORIAL
+    `👋 Halo! Saya Bot Translate.\n\n` +
+      `Cara pakai:\n` +
+      `1) Ketik /help untuk buka menu.\n` +
+      `2) Pilih bahasa tujuan (target).\n` +
+      `3) Nyalakan Auto Translate.\n\n` +
+      `Kalau Auto ON, setiap pesan teks akan otomatis saya terjemahkan.\n\n` +
+      `Status saat ini:\n` +
+      `• Auto: ${cfg.on ? "ON ✅" : "OFF ❌"}\n` +
+      `• Target: ${cfg.lang.toUpperCase()}`
+  );
 
-✅ Commands:
-• /ping
-  cek bot aktif
+  // show menu after greeting
+  await sendMenu(env, chatId);
+}
 
-• /help
-  tampilkan bantuan
+async function sendMenu(env, chatId) {
+  const cfg = await getChatConfig(env, chatId);
 
-• /stats
-  statistik penggunaan
+  const keyboard = buildKeyboard(cfg);
 
-📝 Telegraph:
-• Reply text/foto lalu:
-  /tg
-  atau
-  /tg Judul
-  (bot output link saja)
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: menuText(cfg),
+      reply_markup: { inline_keyboard: keyboard },
+    }),
+  });
+}
 
-🌍 Translate:
-• /settr id
-  set default bahasa translate (untuk /tr)
+async function editMenu(env, chatId, messageId, cfg) {
+  const keyboard = buildKeyboard(cfg);
 
-• Reply pesan + /tr
-  translate cepat
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text: menuText(cfg),
+      reply_markup: { inline_keyboard: keyboard },
+    }),
+  });
+}
 
-• /tr en Hello
-  translate manual (override bahasa)
-
-⚡ Auto Translate (chat / group):
-• /settr auto id on
-  nyalakan auto translate semua pesan ke id
-
-• /settr auto off
-  matikan auto translate chat ini
-
-Catatan group:
-Jika auto translate di group tidak jalan, matikan Group Privacy:
-BotFather → /mybots → Bot Settings → Group Privacy → Turn off
-`
+function menuText(cfg) {
+  return (
+    `⚙️ Translate Settings\n\n` +
+    `• Auto: ${cfg.on ? "ON ✅" : "OFF ❌"}\n` +
+    `• Target language: ${cfg.lang.toUpperCase()}\n\n` +
+    `Pilih target bahasa & ON/OFF lewat tombol di bawah.`
   );
 }
+
+function buildKeyboard(cfg) {
+  // Language buttons (split into rows)
+  const rows = [];
+  const langButtons = LANGS.map(([label, code]) => ({
+    text: (code === cfg.lang ? `✅ ${label}` : label),
+    callback_data: `SET_LANG:${code}`,
+  }));
+
+  for (let i = 0; i < langButtons.length; i += 3) {
+    rows.push(langButtons.slice(i, i + 3));
+  }
+
+  // Toggle row
+  rows.push([
+    { text: cfg.on ? "✅ Auto ON" : "Auto ON", callback_data: "TOGGLE_ON" },
+    { text: !cfg.on ? "✅ Auto OFF" : "Auto OFF", callback_data: "TOGGLE_OFF" },
+  ]);
+
+  // Help row
+  rows.push([{ text: "📌 Info untuk Group", callback_data: "HOW_GROUP" }]);
+
+  return rows;
+}
+
+// ================== STORAGE (KV) ==================
+
+async function getChatConfig(env, chatId) {
+  const key = `cfg:${chatId}`;
+  const raw = await env.FILES.get(key);
+  if (!raw) return { on: false, lang: DEFAULT_LANG };
+
+  try {
+    const cfg = JSON.parse(raw);
+    return {
+      on: typeof cfg.on === "boolean" ? cfg.on : false,
+      lang: typeof cfg.lang === "string" ? cfg.lang : DEFAULT_LANG,
+    };
+  } catch {
+    return { on: false, lang: DEFAULT_LANG };
+  }
+}
+
+async function setChatConfig(env, chatId, cfg) {
+  const key = `cfg:${chatId}`;
+  await env.FILES.put(key, JSON.stringify({ on: !!cfg.on, lang: cfg.lang || DEFAULT_LANG }));
+}
+
+// ================== TRANSLATE (Google unofficial) ==================
+
+async function gTranslate(text, targetLang) {
+  try {
+    const url =
+      `https://translate.googleapis.com/translate_a/single?client=gtx` +
+      `&sl=auto&tl=${encodeURIComponent(targetLang)}` +
+      `&dt=t&q=${encodeURIComponent(text)}`;
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    const translated = Array.isArray(data?.[0])
+      ? data[0].map((x) => x?.[0]).filter(Boolean).join("")
+      : "Gagal translate.";
+
+    const detectedLang = (data?.[2] || "unknown").toLowerCase();
+
+    return { translated, detectedLang };
+  } catch {
+    return { translated: "Gagal translate.", detectedLang: "unknown" };
+  }
+}
+
+function getFlag(lang) {
+  if (!lang) return "🌐";
+  const l = lang.toLowerCase();
+
+  // Some special cases
+  if (l.startsWith("zh")) return "🇨🇳";
+  if (l === "en") return "🇬🇧";
+  if (l.length !== 2) return "🌐";
+
+  const codePoints = [...l.toUpperCase()].map((c) => 127397 + c.charCodeAt(0));
+  return String.fromCodePoint(...codePoints);
+}
+
+// ================== TELEGRAM HELPERS ==================
 
 async function sendMessage(env, chatId, text) {
   await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text })
+    body: JSON.stringify({ chat_id: chatId, text }),
   });
 }
 
@@ -317,30 +289,6 @@ async function answerCallbackQuery(env, id) {
   await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ callback_query_id: id })
+    body: JSON.stringify({ callback_query_id: id }),
   });
-}
-
-async function uploadTelegramPhotoToTelegraph(env, fileId) {
-  // 1) getFilePath from Telegram
-  const fileRes = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
-  const fileJson = await fileRes.json();
-  const filePath = fileJson?.result?.file_path;
-  if (!filePath) throw new Error("no file_path");
-
-  // 2) download file bytes from Telegram CDN
-  const tgFileUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`;
-  const binRes = await fetch(tgFileUrl);
-  if (!binRes.ok) throw new Error("download fail");
-  const blob = await binRes.blob();
-
-  // 3) upload to telegra.ph/upload
-  const form = new FormData();
-  form.append("file", blob, "image.jpg");
-
-  const upRes = await fetch("https://telegra.ph/upload", { method: "POST", body: form });
-  const upJson = await upRes.json();
-  const src = upJson?.[0]?.src;
-  if (!src) throw new Error("upload fail");
-  return src; // like "/file/xxxx.jpg"
-}
+  }
