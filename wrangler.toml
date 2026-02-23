@@ -5,4 +5,4 @@ workers_dev = true
 
 [[kv_namespaces]]
 binding = "FILES"
-id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+id = "318e453a94bb4e378b675b0fd2d0e9b4"
